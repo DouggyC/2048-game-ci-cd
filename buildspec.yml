@@ -30,7 +30,7 @@ version: 0.2
 phases:
   pre_build:
     commands:
-      - echo "Getting AWS Account ID..."
+      - echo "Fetching AWS Account ID..."
       - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
       - echo "Ensuring S3 bucket exists..."
       - |
@@ -40,7 +40,7 @@ phases:
       - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
       - echo "Ensuring ECR repository exists..."
       - |
-        aws ecr describe-repositories --repository-names $REPO_NAME || \
+        aws ecr describe-repositories --repository-names $REPO_NAME 2>/dev/null || \
         aws ecr create-repository --repository-name $REPO_NAME
       - echo "Setting Docker image tag..."
       - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:7}
@@ -63,7 +63,7 @@ phases:
         if ! aws ecs describe-clusters --clusters $ECS_CLUSTER | grep -q ACTIVE; then
           aws ecs create-cluster --cluster-name $ECS_CLUSTER
         fi
-      - echo "Generating ECS Task Definition JSON..."
+      - echo "Generating ECS Task Definition..."
       - |
         TASK_DEF_JSON=$(printf '{
           "family": "%s",
@@ -84,7 +84,7 @@ phases:
         echo "$TASK_DEF_JSON" > task-def.json
       - TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
       - echo "Task Definition ARN: $TASK_DEF_ARN"
-      - echo "Creating/updating ECS Service..."
+      - echo "Creating or updating ECS Service..."
       - |
         if ! aws ecs describe-services --cluster $ECS_CLUSTER --services $ECS_SERVICE --query 'services[?status==`ACTIVE`].serviceName' --output text | grep -q $ECS_SERVICE; then
           aws ecs create-service \
