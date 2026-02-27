@@ -31,25 +31,21 @@ phases:
   pre_build:
     commands:
       - echo "Fetching AWS Account ID..."
-      - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output
-        text)
+      - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
       - echo "Ensuring S3 bucket exists..."
       - |
         aws s3api head-bucket --bucket $S3_BUCKET 2>/dev/null || \
         aws s3 mb s3://$S3_BUCKET --region $AWS_REGION
       - echo "Logging in to Amazon ECR..."
-      - aws ecr get-login-password --region $AWS_REGION | docker login
-        --username AWS --password-stdin
-        $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
       - echo "Ensuring ECR repository exists..."
-      - >
-        aws ecr describe-repositories --repository-names $REPO_NAME 2>/dev/null
-        || \
-
+      - |
+        aws ecr describe-repositories --repository-names $REPO_NAME 2>/dev/null || \
         aws ecr create-repository --repository-name $REPO_NAME
       - echo "Setting Docker image tag..."
       - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:7}
       - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME
+
   build:
     commands:
       - echo "Building Docker image..."
@@ -68,7 +64,7 @@ phases:
           aws ecs create-cluster --cluster-name $ECS_CLUSTER
         fi
       - echo "Generating ECS Task Definition..."
-      - >
+      - |
         TASK_DEF_JSON=$(printf '{
           "family": "%s",
           "networkMode": "awsvpc",
@@ -85,7 +81,6 @@ phases:
           "cpu": "256",
           "memory": "512"
         }' "$ECS_TASK_DEF_FAMILY" "$AWS_ACCOUNT_ID" "$REPO_NAME" "$REPOSITORY_URI:$IMAGE_TAG")
-
         echo "$TASK_DEF_JSON" > task-def.json
       - TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json
         file://task-def.json --query 'taskDefinition.taskDefinitionArn' --output
