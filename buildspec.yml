@@ -1,22 +1,136 @@
 version: 0.2
 
+# Buildspec for AWS CodeBuild
+# ---------------------------
+# This buildspec automates:
+# 1. Pulling the latest code from GitHub (triggered by webhook or manual build)
+# 2. Ensuring the S3 artifact bucket exists (creates it if missing)
+# 3. Logging into Amazon ECR
+# 4. Creating ECR repository if missing
+# 5. Building Docker image and tagging with commit SHA + "latest"
+# 6. Pushing Docker image to ECR
+# 7. Creating ECS Fargate cluster if missing
+# 8. Registering ECS Task Definition
+# 9. Creating ECS Service if missing
+# 10. Updating ECS Service with new task definition
+# 11. Uploading imagedefinitions.json to S3 with commit SHA for traceability
+#
+# IMPORTANT:
+# The following variables must be configured in the CodeBuild project
+# Environment Variables section (not here in buildspec):
+# - REPO_NAME
+# - ECS_CLUSTER
+# - ECS_SERVICE
+# - ECS_TASK_DEF_FAMILY
+# - S3_BUCKET
+# - AWS_REGION
+#
+# This enables reusable pipelines across environments (dev/stage/prod)
+
 phases:
   pre_build:
     commands:
-      - echo Logging in to Amazon ECR...
-      - aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 095032391984.dkr.ecr.us-east-1.amazonaws.com
+      - echo "Getting AWS account ID dynamically..."
+      - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      # Retrieves AWS Account ID dynamically so build works in any AWS account
+
+      - echo "Ensuring S3 bucket exists..."
+      - |
+        aws s3api head-bucket --bucket $S3_BUCKET 2>/dev/null || \
+        aws s3 mb s3://$S3_BUCKET --region $AWS_REGION
+      # Checks if S3 bucket exists
+      # If it does not exist, it creates the bucket automatically
+      # NOTE: S3 bucket names are globally unique across AWS
+
+      - echo "Logging in to Amazon ECR..."
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+      # Authenticates Docker to push images into ECR
+
+      - echo "Creating ECR repository if it doesn't exist..."
+      - |
+        aws ecr describe-repositories --repository-names $REPO_NAME || \
+        aws ecr create-repository --repository-name $REPO_NAME
+      # Ensures ECR repository exists before pushing image
+
+      - echo "Setting image tag based on Git commit SHA..."
+      - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:7}
+      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION/$REPO_NAME
+      # IMAGE_TAG = short Git commit hash (first 7 chars)
+      # This ensures traceability between Docker image and Git commit
+
   build:
     commands:
-      - echo Building the Docker image...
-      - docker build -t 2048-game .
-      - echo Tagging the Docker image...
-      - docker tag 2048-game:latest 095032391984.dkr.ecr.us-east-1.amazonaws.com/2048-game-repo:latest
+      - echo "Building Docker image..."
+      - docker build -t $REPO_NAME .
+      # Builds Docker image from Dockerfile
+
+      - docker tag $REPO_NAME:latest $REPOSITORY_URI:$IMAGE_TAG
+      - docker tag $REPO_NAME:latest $REPOSITORY_URI:latest
+      # Tags image twice:
+      # 1. Commit SHA tag (immutable version reference)
+      # 2. latest tag (moving reference)
+
   post_build:
     commands:
-      - echo Pushing the Docker image to Amazon ECR...
-      - docker push 095032391984.dkr.ecr.us-east-1.amazonaws.com/2048-game-repo:latest
-      - echo Creating imagedefinitions.json file for ECS deployment...
-      - echo '[{"name":"2048-container","imageUri":"095032391984.dkr.ecr.us-east-1.amazonaws.com/2048-game-repo:latest"}]' > imagedefinitions.json
+      - echo "Pushing Docker image to ECR..."
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+      - docker push $REPOSITORY_URI:latest
+      # Push both commit-based and latest tags to ECR
+
+      - echo "Creating ECS cluster if it doesn't exist..."
+      - aws ecs describe-clusters --clusters $ECS_CLUSTER || aws ecs create-cluster --cluster-name $ECS_CLUSTER
+      # Ensures ECS cluster exists (creates if missing)
+
+      - echo "Registering ECS Task Definition..."
+      - |
+        TASK_DEF_JSON=$(printf '{
+          "family": "%s",
+          "networkMode": "awsvpc",
+          "executionRoleArn": "arn:aws:iam::%s:role/ecsTaskExecutionRole",
+          "containerDefinitions": [
+            {
+              "name": "%s",
+              "image": "%s",
+              "essential": true,
+              "portMappings": [{"containerPort": 80,"hostPort": 80}]
+            }
+          ],
+          "requiresCompatibilities": ["FARGATE"],
+          "cpu": "256",
+          "memory": "512"
+        }' $ECS_TASK_DEF_FAMILY $AWS_ACCOUNT_ID $REPO_NAME $REPOSITORY_URI:$IMAGE_TAG)
+      # Dynamically generates ECS task definition JSON
+      # Uses commit SHA image for deployment
+
+      - echo "$TASK_DEF_JSON" > task-def.json
+      - TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
+      - echo "Registered Task Definition ARN: $TASK_DEF_ARN"
+      # Registers new revision of task definition
+
+      - echo "Creating ECS Service if it doesn't exist..."
+      - |
+        aws ecs describe-services --cluster $ECS_CLUSTER --services $ECS_SERVICE || \
+        aws ecs create-service \
+          --cluster $ECS_CLUSTER \
+          --service-name $ECS_SERVICE \
+          --task-definition $TASK_DEF_ARN \
+          --desired-count 1 \
+          --launch-type FARGATE \
+          --network-configuration 'awsvpcConfiguration={subnets=["subnet-xxxx"],securityGroups=["sg-xxxx"],assignPublicIp="ENABLED"}'
+      # Creates ECS service only if missing
+      # ⚠ Replace subnet-xxxx and sg-xxxx with real values
+
+      - echo "Updating ECS Service with new Task Definition..."
+      - aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --task-definition $TASK_DEF_ARN
+      # Forces ECS rolling deployment using new image
+
+      - echo "Writing imagedefinitions.json to S3..."
+      - printf '[{"name":"%s","imageUri":"%s"}]' $REPO_NAME $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
+      - aws s3 cp imagedefinitions.json s3://$S3_BUCKET/imagedefinitions-$IMAGE_TAG.json
+      # Stores deployment metadata in S3
+      # Enables traceability per commit
+
 artifacts:
   files:
     - imagedefinitions.json
+  # This artifact can be used by CodePipeline (if added later)
