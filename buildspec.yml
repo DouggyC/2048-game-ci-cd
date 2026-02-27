@@ -32,59 +32,44 @@ version: 0.2
 phases:
   pre_build:
     commands:
-      - echo "Getting AWS account ID dynamically..."
+      - echo "Getting AWS Account ID..."
       - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-      # Retrieves AWS Account ID dynamically so build works in any AWS account
 
       - echo "Ensuring S3 bucket exists..."
       - |
         aws s3api head-bucket --bucket $S3_BUCKET 2>/dev/null || \
         aws s3 mb s3://$S3_BUCKET --region $AWS_REGION
-      # Checks if S3 bucket exists
-      # If it does not exist, it creates the bucket automatically
-      # NOTE: S3 bucket names are globally unique across AWS
 
       - echo "Logging in to Amazon ECR..."
       - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
-      # Authenticates Docker to push images into ECR
 
-      - echo "Creating ECR repository if it doesn't exist..."
+      - echo "Ensuring ECR repository exists..."
       - |
         aws ecr describe-repositories --repository-names $REPO_NAME || \
         aws ecr create-repository --repository-name $REPO_NAME
-      # Ensures ECR repository exists before pushing image
 
-      - echo "Setting image tag based on Git commit SHA..."
+      - echo "Setting Docker image tag..."
       - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:7}
-      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION/$REPO_NAME
-      # IMAGE_TAG = short Git commit hash (first 7 chars)
-      # This ensures traceability between Docker image and Git commit
+      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME
 
   build:
     commands:
       - echo "Building Docker image..."
       - docker build -t $REPO_NAME .
-      # Builds Docker image from Dockerfile
-
       - docker tag $REPO_NAME:latest $REPOSITORY_URI:$IMAGE_TAG
       - docker tag $REPO_NAME:latest $REPOSITORY_URI:latest
-      # Tags image twice:
-      # 1. Commit SHA tag (immutable version reference)
-      # 2. latest tag (moving reference)
 
   post_build:
     commands:
       - echo "Pushing Docker image to ECR..."
       - docker push $REPOSITORY_URI:$IMAGE_TAG
       - docker push $REPOSITORY_URI:latest
-      # Push both commit-based and latest tags to ECR
 
-      - echo "Creating ECS cluster if it doesn't exist..."
+      - echo "Ensuring ECS cluster exists..."
       - |
         if ! aws ecs describe-clusters --clusters $ECS_CLUSTER | grep -q ACTIVE; then
           aws ecs create-cluster --cluster-name $ECS_CLUSTER
         fi
-      # Ensures ECS cluster exists (creates if missing)
 
       - echo "Registering ECS Task Definition..."
       - |
@@ -105,18 +90,13 @@ phases:
           "memory": "512"
         }' "$ECS_TASK_DEF_FAMILY" "$AWS_ACCOUNT_ID" "$REPO_NAME" "$REPOSITORY_URI:$IMAGE_TAG")
         echo "$TASK_DEF_JSON" > task-def.json
-        
-      # Dynamically generates ECS task definition JSON
-      # Uses commit SHA image for deployment
 
       - TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
-      - echo "Registered Task Definition ARN: $TASK_DEF_ARN"
-      # Registers new revision of task definition
+      - echo "Task Definition ARN: $TASK_DEF_ARN"
 
-      - echo "Creating ECS Service if it doesn't exist..."
+      - echo "Creating/updating ECS Service..."
       - |
         if ! aws ecs describe-services --cluster $ECS_CLUSTER --services $ECS_SERVICE --query 'services[?status==`ACTIVE`].serviceName' --output text | grep -q $ECS_SERVICE; then
-          echo "Creating new service..."
           aws ecs create-service \
             --cluster $ECS_CLUSTER \
             --service-name $ECS_SERVICE \
@@ -125,20 +105,13 @@ phases:
             --launch-type FARGATE \
             --network-configuration "awsvpcConfiguration={subnets=[$ECS_SUBNET],securityGroups=[$ECS_SG],assignPublicIp=ENABLED}"
         else
-          echo "Updating existing service..."
           aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --task-definition $TASK_DEF_ARN
         fi
-      # Creates ECS service only if missing
 
-      # Forces ECS rolling deployment using new image
-
-      - echo "Writing imagedefinitions.json to S3..."
+      - echo "Uploading imagedefinitions.json to S3..."
       - printf '[{"name":"%s","imageUri":"%s"}]' $REPO_NAME $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
       - aws s3 cp imagedefinitions.json s3://$S3_BUCKET/imagedefinitions-$IMAGE_TAG.json
-      # Stores deployment metadata in S3
-      # Enables traceability per commit
 
 artifacts:
   files:
     - imagedefinitions.json
-  # This artifact can be used by CodePipeline (if added later)
