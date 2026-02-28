@@ -32,7 +32,7 @@ phases:
     commands:
       - echo "Fetching AWS Account ID..."
       - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-      - echo "Ensuring S3 bucket exists..."
+      - echo "Ensuring S3 bucket exists, else create"
       - |
         aws s3api head-bucket --bucket $S3_BUCKET 2>/dev/null || \
         aws s3 mb s3://$S3_BUCKET --region $AWS_REGION
