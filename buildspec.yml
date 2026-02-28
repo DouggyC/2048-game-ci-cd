@@ -38,10 +38,12 @@ phases:
       - 
       - echo "Logging in to Amazon ECR..."
       - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
-      - echo "Ensuring ECR repository exists..."
+      - 
+      - echo "Ensuring ECR repository exists, else create"
       - |
         aws ecr describe-repositories --repository-names $REPO_NAME 2>/dev/null || \
         aws ecr create-repository --repository-name $REPO_NAME
+        
       - echo "Setting Docker image tag..."
       - IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
       - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME
